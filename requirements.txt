@@ -1,0 +1,11 @@
+streamlit>=1.42.0
+colpali-engine
+pymupdf
+google-genai>=0.5.0
+python-dotenv
+pandas
+requests
+matplotlib
+Pillow
+lxml
+accelerate
