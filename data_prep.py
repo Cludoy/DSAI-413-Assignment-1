@@ -1,56 +1,107 @@
 import json
+import random
+from collections import defaultdict
 from pathlib import Path
 from PIL import Image
 import fitz  # PyMuPDF
 from tqdm import tqdm
 
-# Per-file page limits (None = no limit)
+# Per-file page limits applied during manifest extraction and indexing.
+# Populated at runtime with fankit PDFs; add overrides here if needed.
 PAGE_LIMITS: dict[str, int | None] = {
     "drop_tables.pdf": 100,
-    "fankit_assets.pdf": None,
+    # fankit_<category>.pdf entries are added dynamically by compile_fankit_by_category()
 }
 
 
-# ---------------------------------------------------------------------------
-# Fan-Kit Compilation
-# ---------------------------------------------------------------------------
+def _safe_category_name(name: str) -> str:
+    """Convert a folder name to a safe PDF filename stem."""
+    return name.lower().replace(" ", "_").replace("/", "-")
 
-def compile_fan_kit_images(fankit_dir: str, output_path: str, num_images: int = 8):
+
+def compile_fankit_by_category(
+    fankit_dir: str,
+    output_dir: str,
+    images_per_pdf: int = 8,
+    seed: int | None = None,
+) -> list[str]:
     """
-    Recursively scans the provided fankit directory for image files,
-    selects a limited subset, and concatenates them into a single PDF.
+    Groups all images in fankit_dir by their top-level subfolder and produces
+    one PDF per category, each containing a random sample of images_per_pdf images.
+
+    Args:
+        fankit_dir:    Path to the fankit root directory.
+        output_dir:    Directory where output PDFs are written.
+        images_per_pdf: Number of images randomly selected per category PDF.
+        seed:          Random seed for reproducibility. If None, a new random
+                       seed is chosen each run and printed so results can be
+                       reproduced. Pass the same seed to get the same selection.
+
+    Returns:
+        List of output PDF file paths that were successfully created.
     """
-    print(f"Scanning {fankit_dir} for visual assets...")
     root_path = Path(fankit_dir)
-    image_paths = []
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
 
-    for ext in ['*.jpg', '*.jpeg', '*.png']:
-        image_paths.extend(list(root_path.rglob(ext)))
+    # ── Discover all images ──────────────────────────────────────────────────
+    all_images: list[Path] = []
+    for ext in ["*.jpg", "*.jpeg", "*.png"]:
+        all_images.extend(root_path.rglob(ext))
 
-    if not image_paths:
+    if not all_images:
         print("No images found in fankit directory.")
-        return
+        return []
 
-    print(f"Found {len(image_paths)} images. Processing subset of {num_images}...")
-    selected_paths = image_paths[:num_images]
-    pdf_images = []
+    # ── Group by top-level subfolder → category ──────────────────────────────
+    categories: dict[str, list[Path]] = defaultdict(list)
+    for img_path in all_images:
+        rel = img_path.relative_to(root_path)
+        category = rel.parts[0] if len(rel.parts) > 1 else "General"
+        categories[category].append(img_path)
 
-    for path in selected_paths:
-        try:
-            with Image.open(path) as img:
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                pdf_images.append(img.copy())
-                print(f"  Loaded {path.name}")
-        except Exception as e:
-            print(f"  Failed to process {path.name}: {e}")
+    # ── Resolve seed ─────────────────────────────────────────────────────────
+    if seed is None:
+        seed = random.randint(0, 2**31)
+    tqdm.write(f"Fankit random seed: {seed}  (reuse to reproduce this selection)")
+    rng = random.Random(seed)
 
-    if pdf_images:
+    created_pdfs: list[str] = []
+    cat_bar = tqdm(sorted(categories.items()), desc="Fankit categories", unit="cat")
+
+    for category, img_paths in cat_bar:
+        cat_bar.set_postfix(category=category)
+        safe_name = _safe_category_name(category)
+        output_path = str(out_path / f"fankit_{safe_name}.pdf")
+
+        # Random sample (or all images if fewer than images_per_pdf)
+        sample = rng.sample(img_paths, min(images_per_pdf, len(img_paths)))
+        tqdm.write(f"  [{category}] {len(img_paths)} images -> sampling {len(sample)} -> {Path(output_path).name}")
+
+        pdf_images: list[Image.Image] = []
+        for path in tqdm(sample, desc=f"    Loading", unit="img", leave=False):
+            try:
+                with Image.open(path) as img:
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    pdf_images.append(img.copy())
+            except Exception as e:
+                tqdm.write(f"    Skipped {path.name}: {e}")
+
+        if not pdf_images:
+            tqdm.write(f"  [{category}] No valid images loaded — skipping.")
+            continue
+
         try:
             pdf_images[0].save(output_path, save_all=True, append_images=pdf_images[1:])
-            print(f"Successfully compiled Fan Kit PDF → {output_path}")
+            tqdm.write(f"  [{category}] Saved -> {Path(output_path).name}")
+            created_pdfs.append(output_path)
+            # Register in PAGE_LIMITS (no cap for fankit PDFs)
+            PAGE_LIMITS[Path(output_path).name] = None
         except Exception as e:
-            print(f"Error saving Fan Kit PDF: {e}")
+            tqdm.write(f"  [{category}] Error saving PDF: {e}")
+
+    return created_pdfs
 
 
 # ---------------------------------------------------------------------------
@@ -176,28 +227,47 @@ def build_multimodal_manifest(docs_dir: str = "docs", manifest_path: str = "docs
 
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
-    print(f"\nMulti-modal manifest saved → {manifest_path}")
+    print(f"\nMulti-modal manifest saved -> {manifest_path}")
 
 
 # ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
 
-def main():
+def main(seed: int | None = None):
+    """
+    Full data preparation pipeline:
+      1. Compile fankit images → one PDF per category (randomized)
+      2. Extract multi-modal metadata from all docs → JSON manifest
+
+    Args:
+        seed: Optional random seed for fankit image selection.
+              Printed at runtime so you can reproduce a run.
+    """
     docs_dir = Path("docs")
     docs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Compile fan-kit images → PDF
+    # Step 1: Compile fan-kit images → one PDF per category
     fankit_dir = "fankit"
-    fankit_output_path = str(docs_dir / "fankit_assets.pdf")
     if Path(fankit_dir).exists():
-        compile_fan_kit_images(fankit_dir, fankit_output_path, num_images=8)
+        print(f"\n── Fankit compilation ({'random seed=' + str(seed) if seed else 'random seed auto'}) ──")
+        created = compile_fankit_by_category(
+            fankit_dir=fankit_dir,
+            output_dir=str(docs_dir),
+            images_per_pdf=8,
+            seed=seed,
+        )
+        print(f"Created {len(created)} fankit PDFs: {[Path(p).name for p in created]}")
     else:
-        print(f"Warning: Fan Kit directory '{fankit_dir}' not found. Skipping fan kit compilation.")
+        print(f"Warning: Fan Kit directory '{fankit_dir}' not found. Skipping fankit compilation.")
 
     # Step 2: Extract multi-modal metadata and write manifest
+    print("\n── Multi-modal manifest extraction ──")
     build_multimodal_manifest(str(docs_dir))
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    # Optionally pass a seed as the first CLI argument: python data_prep.py 42
+    cli_seed = int(sys.argv[1]) if len(sys.argv) > 1 else None
+    main(seed=cli_seed)
