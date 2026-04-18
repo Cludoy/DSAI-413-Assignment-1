@@ -6,7 +6,9 @@ import io
 import fitz  # PyMuPDF
 from pathlib import Path
 from PIL import Image
+from tqdm import tqdm
 from colpali_engine.models import ColIdefics3, ColIdefics3Processor
+from data_prep import PAGE_LIMITS
 
 def build_index(docs_dir: str = "docs", output_index: str = "docs/colsmol_index.pt",
                 manifest_path: str = "docs/multimodal_manifest.json"):
@@ -47,14 +49,22 @@ def build_index(docs_dir: str = "docs", output_index: str = "docs/colsmol_index.
     }
     
     print(f"Indexing PDFs inside '{docs_dir}'...")
+    pdf_files = sorted(docs_path.glob("*.pdf"))
     with torch.no_grad():
-        for pdf_file in docs_path.glob("*.pdf"):
-            print(f"Processing {pdf_file.name}...")
-            
-            # Load PDF via PyMuPDF internally removing Poppler strict dependencies
+        for pdf_file in tqdm(pdf_files, desc="PDFs", unit="file"):
+            max_pages = PAGE_LIMITS.get(pdf_file.name)  # None = no limit
+            limit_str = f" (capped at {max_pages} pages)" if max_pages else ""
+            tqdm.write(f"Processing {pdf_file.name}{limit_str}...")
+
+            # Load PDF pages as images via PyMuPDF
             doc = fitz.open(pdf_file)
             images = []
-            for page in doc:
+            total_pages = min(len(doc), max_pages) if max_pages else len(doc)
+            for page_idx, page in enumerate(
+                tqdm(doc, total=total_pages, desc=f"  Rendering {pdf_file.name}", unit="pg", leave=False)
+            ):
+                if max_pages is not None and page_idx >= max_pages:
+                    break
                 pix = page.get_pixmap(dpi=150)
                 img = Image.open(io.BytesIO(pix.tobytes("jpeg")))
                 images.append(img)
@@ -62,7 +72,14 @@ def build_index(docs_dir: str = "docs", output_index: str = "docs/colsmol_index.
             
             # Avoid out of memory by batching locally
             batch_size = 4
-            for i in range(0, len(images), batch_size):
+            num_batches = (len(images) + batch_size - 1) // batch_size
+            for i in tqdm(
+                range(0, len(images), batch_size),
+                total=num_batches,
+                desc=f"  Encoding {pdf_file.name}",
+                unit="batch",
+                leave=False,
+            ):
                 batch_imgs = images[i : i + batch_size]
                 
                 # Pre-process image to Base64 mapping for later Gemini evaluation

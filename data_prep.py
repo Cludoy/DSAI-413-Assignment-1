@@ -2,6 +2,13 @@ import json
 from pathlib import Path
 from PIL import Image
 import fitz  # PyMuPDF
+from tqdm import tqdm
+
+# Per-file page limits (None = no limit)
+PAGE_LIMITS: dict[str, int | None] = {
+    "drop_tables.pdf": 100,
+    "fankit_assets.pdf": None,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -61,19 +68,31 @@ def _classify_page(text: str, table_count: int, image_count: int) -> str:
     return "mixed"
 
 
-def extract_multimodal_metadata(pdf_path: str) -> list[dict]:
+def extract_multimodal_metadata(pdf_path: str, max_pages: int | None = None) -> list[dict]:
     """
     Extracts three modalities from every page of a PDF:
       - Text  : plain text layer via PyMuPDF text extraction
       - Tables: structured row/column data via PyMuPDF find_tables()
       - Charts/Images: embedded image metadata (dimensions, count, positions)
 
+    Args:
+        pdf_path:  Path to the PDF file.
+        max_pages: If set, only the first N pages are processed.
+
     Returns a list of per-page dicts ready to be merged into the index.
     """
     doc = fitz.open(pdf_path)
+    total = len(doc)
+    if max_pages is not None:
+        total = min(total, max_pages)
     pages_meta = []
 
-    for page_num, page in enumerate(doc, start=1):
+    pdf_name = Path(pdf_path).name
+    for page_num, page in enumerate(
+        tqdm(doc, total=total, desc=f"  {pdf_name}", unit="pg"), start=1
+    ):
+        if max_pages is not None and page_num > max_pages:
+            break
         # ── 1. Text extraction ──────────────────────────────────────────────
         text = page.get_text("text").strip()
 
@@ -138,17 +157,22 @@ def build_multimodal_manifest(docs_dir: str = "docs", manifest_path: str = "docs
         return
 
     manifest = {}
-    for pdf_file in pdf_files:
-        print(f"Extracting multi-modal metadata from {pdf_file.name}...")
-        pages = extract_multimodal_metadata(str(pdf_file))
+    outer_bar = tqdm(pdf_files, desc="PDFs", unit="file")
+    for pdf_file in outer_bar:
+        outer_bar.set_postfix(file=pdf_file.name)
+        max_pages = PAGE_LIMITS.get(pdf_file.name)  # None = no limit
+        pages = extract_multimodal_metadata(str(pdf_file), max_pages=max_pages)
         manifest[pdf_file.name] = pages
 
         # Per-PDF summary
         total_tables = sum(len(p["tables"]) for p in pages)
         total_images = sum(len(p["image_metadata"]) for p in pages)
         total_text_chars = sum(len(p["text"]) for p in pages)
-        print(f"  Pages: {len(pages)} | Tables: {total_tables} | "
-              f"Embedded images: {total_images} | Text chars: {total_text_chars}")
+        limit_str = f" (capped at {max_pages}pg)" if max_pages else ""
+        tqdm.write(
+            f"  {pdf_file.name}{limit_str}: {len(pages)} pages | "
+            f"Tables: {total_tables} | Images: {total_images} | Text chars: {total_text_chars}"
+        )
 
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
