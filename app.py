@@ -35,6 +35,12 @@ if query:
         for idx, col in enumerate(cols):
             with col:
                 doc = retrieved_docs[idx]
-                st.markdown(f"**Doc Identifier:** {doc['doc_id']} | **Page:** {doc['page_num']} | **Score:** {doc['score']:.2f}")
+                st.markdown(
+                    f"**Doc:** `{doc['doc_id']}` &nbsp;|&nbsp; "
+                    f"**Page:** {doc['page_num']} &nbsp;|&nbsp; "
+                    f"**Type:** `{doc.get('page_type','—')}` &nbsp;|&nbsp; "
+                    f"**Score:** {doc['score']:.3f} "
+                    f"*(visual: {doc.get('visual_score',0):.1f}, kw: {doc.get('keyword_score',0):.2f})*"
+                )
                 b64_img = doc['base64']
                 st.image(base64.b64decode(b64_img), use_container_width=True, caption=f"Retrieved Source {idx+1}")

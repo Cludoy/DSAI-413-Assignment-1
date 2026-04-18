@@ -27,7 +27,7 @@ def run_evaluation(index_name: str = "warframe_index"):
     and logs the generation performance natively.
     """
     print(f"Initializing QA Pipeline for Evaluation Suite...")
-    qa_system = WarframeQA(index_name=index_name)
+    qa_system = WarframeQA(index_path="docs/colsmol_index.pt")
     
     if qa_system.model is None:
         print("Indexer is not set up correctly. Please deploy indexer.py first on the curated PDFs.")
